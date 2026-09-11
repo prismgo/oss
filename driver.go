@@ -1,0 +1,378 @@
+package oss
+
+import (
+	"bytes"
+	"context"
+	"fmt"
+	"io"
+	"net/http"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/aliyun/aliyun-oss-go-sdk/oss"
+
+	"github.com/prismgo/framework/filesystem"
+)
+
+// Driver 基于 aliyun-oss-go-sdk 适配统一文件系统接口。
+type Driver struct {
+	bucket     *oss.Bucket
+	cfg        filesystem.OSSConfig
+	baseURL    string
+	visibility string
+}
+
+var _ filesystem.Driver = (*Driver)(nil)
+
+// NewDriver 创建 OSS 驱动实例。
+func NewDriver(cfg filesystem.OSSConfig) (*Driver, error) {
+	if strings.TrimSpace(cfg.Bucket) == "" || strings.TrimSpace(cfg.Endpoint) == "" {
+		return nil, fmt.Errorf("filesystem: oss bucket or endpoint is empty")
+	}
+	clientOptions := []oss.ClientOption{}
+	if cfg.Timeout > 0 {
+		// OSS SDK 的超时配置以秒为单位，向上取整避免亚秒配置被截断成无限等待。
+		seconds := int64((cfg.Timeout + time.Second - 1) / time.Second)
+		clientOptions = append(clientOptions, oss.Timeout(seconds, seconds))
+	}
+	client, err := oss.New(strings.TrimSpace(cfg.Endpoint), strings.TrimSpace(cfg.AccessKey), strings.TrimSpace(cfg.SecretKey), clientOptions...)
+	if err != nil {
+		return nil, err
+	}
+	bucket, err := client.Bucket(strings.TrimSpace(cfg.Bucket))
+	if err != nil {
+		return nil, err
+	}
+	cfg.Prefix = normalizeDir(cfg.Prefix)
+	cfg.Visibility = ensureVisibility(cfg.Visibility, filesystem.VisibilityPrivate)
+	baseURL := strings.TrimRight(strings.TrimSpace(cfg.URL), "/")
+	if baseURL == "" {
+		endpoint := strings.TrimSpace(cfg.Endpoint)
+		if !strings.HasPrefix(endpoint, "http://") && !strings.HasPrefix(endpoint, "https://") {
+			endpoint = "https://" + endpoint
+		}
+		baseURL = strings.TrimRight(endpoint, "/") + "/" + strings.TrimSpace(cfg.Bucket)
+	}
+	return &Driver{
+		bucket:     bucket,
+		cfg:        cfg,
+		baseURL:    baseURL,
+		visibility: cfg.Visibility,
+	}, nil
+}
+
+// Close 预留关闭方法，当前 OSS SDK 无需显式关闭。
+func (d *Driver) Close() error {
+	return nil
+}
+
+// Write 把内容写入 OSS 对象。
+func (d *Driver) Write(ctx context.Context, key string, reader io.Reader, opts filesystem.PutOptions) error {
+	key = d.objectKey(key)
+	options := ossRequestOptions(ctx)
+	if opts.ContentType != "" {
+		options = append(options, oss.ContentType(opts.ContentType))
+	}
+	options = append(options, oss.ObjectACL(d.objectACL(opts.Visibility)))
+	return d.bucket.PutObject(key, reader, options...)
+}
+
+// ReadAll 读取整个对象内容。
+func (d *Driver) ReadAll(ctx context.Context, key string) ([]byte, error) {
+	rc, _, err := d.Open(ctx, key)
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		if err := rc.Close(); err != nil {
+			reportCleanupError(ctx, err, "close_oss_reader", map[string]any{"key": key})
+		}
+	}()
+	return io.ReadAll(rc)
+}
+
+// Open 打开对象读取流并附带元信息。
+func (d *Driver) Open(ctx context.Context, key string) (io.ReadCloser, filesystem.FileInfo, error) {
+	key = d.objectKey(key)
+	result, err := d.bucket.DoGetObject(&oss.GetObjectRequest{ObjectKey: key}, ossRequestOptions(ctx))
+	if err != nil {
+		return nil, filesystem.FileInfo{}, err
+	}
+	info := d.fileInfoFromResponse(key, result.Response)
+	return result.Response.Body, info, nil
+}
+
+// Exists 判断对象是否存在。
+func (d *Driver) Exists(ctx context.Context, key string) (bool, error) {
+	return d.bucket.IsObjectExist(d.objectKey(key), ossRequestOptions(ctx)...)
+}
+
+// DirectoryExists 判断 OSS 目录前缀是否存在。
+func (d *Driver) DirectoryExists(ctx context.Context, dir string) (bool, error) {
+	marker := d.objectKey(normalizeDir(dir))
+	if marker != "" {
+		exists, err := d.bucket.IsObjectExist(marker, ossRequestOptions(ctx)...)
+		if err != nil || exists {
+			return exists, err
+		}
+	}
+	items, err := d.List(ctx, dir, false)
+	if err != nil {
+		return false, err
+	}
+	return len(items) > 0, nil
+}
+
+// Delete 删除对象。
+func (d *Driver) Delete(ctx context.Context, key string) error {
+	return d.bucket.DeleteObject(d.objectKey(key), ossRequestOptions(ctx)...)
+}
+
+// Copy 在同一桶内复制对象。
+func (d *Driver) Copy(ctx context.Context, src, dst string) error {
+	_, err := d.bucket.CopyObject(d.objectKey(src), d.objectKey(dst), ossRequestOptions(ctx)...)
+	return err
+}
+
+// Move 通过“先复制后删除”实现移动。
+func (d *Driver) Move(ctx context.Context, src, dst string) error {
+	if err := d.Copy(ctx, src, dst); err != nil {
+		return err
+	}
+	return d.Delete(ctx, src)
+}
+
+// Stat 读取对象元信息。
+func (d *Driver) Stat(ctx context.Context, key string) (filesystem.FileInfo, error) {
+	headers, err := d.bucket.GetObjectDetailedMeta(d.objectKey(key), ossRequestOptions(ctx)...)
+	if err != nil {
+		return filesystem.FileInfo{}, err
+	}
+	return d.fileInfoFromHeaders(key, headers), nil
+}
+
+// List 列出对象或目录前缀。
+func (d *Driver) List(ctx context.Context, prefix string, recursive bool) ([]filesystem.FileInfo, error) {
+	objectPrefix := d.objectKey(prefix)
+	if objectPrefix != "" && !strings.HasSuffix(objectPrefix, "/") {
+		objectPrefix += "/"
+	}
+	baseOptions := ossRequestOptions(ctx, oss.Prefix(objectPrefix), oss.MaxKeys(1000), oss.ListType(2))
+	if !recursive {
+		baseOptions = append(baseOptions, oss.Delimiter("/"))
+	}
+	items := make([]filesystem.FileInfo, 0)
+	continuationToken := ""
+	for {
+		options := baseOptions
+		if continuationToken != "" {
+			options = append(options, oss.ContinuationToken(continuationToken))
+		}
+		res, err := d.bucket.ListObjectsV2(options...)
+		if err != nil {
+			return nil, err
+		}
+		for _, current := range res.Objects {
+			// 在递归模式下，跳过目录标记对象（以 "/" 结尾的对象），这些对象会在 DeleteDirectory 最后单独删除
+			if recursive && strings.HasSuffix(current.Key, "/") {
+				continue
+			}
+			items = append(items, filesystem.FileInfo{
+				Path:         d.stripPrefix(current.Key),
+				Size:         current.Size,
+				LastModified: current.LastModified,
+				IsDir:        strings.HasSuffix(current.Key, "/"),
+			})
+		}
+		if !recursive {
+			for _, current := range res.CommonPrefixes {
+				items = append(items, filesystem.FileInfo{
+					Path:  strings.TrimSuffix(d.stripPrefix(current), "/"),
+					IsDir: true,
+				})
+			}
+		}
+		if !res.IsTruncated {
+			break
+		}
+		continuationToken = res.NextContinuationToken
+	}
+	return items, nil
+}
+
+// MakeDirectory 通过创建零字节占位对象模拟目录。
+func (d *Driver) MakeDirectory(ctx context.Context, dir string) error {
+	return d.bucket.PutObject(d.objectKey(normalizeDir(dir)), bytes.NewReader(nil), ossRequestOptions(ctx)...)
+}
+
+// DeleteDirectory 递归删除指定前缀下的所有对象。
+func (d *Driver) DeleteDirectory(ctx context.Context, dir string) error {
+	if err := rejectEmptyDirectory(dir); err != nil {
+		return err
+	}
+	items, err := d.List(ctx, dir, true)
+	if err != nil {
+		return err
+	}
+	for _, item := range items {
+		if err := d.Delete(ctx, item.Path); err != nil {
+			return err
+		}
+	}
+	if dir = strings.TrimSpace(dir); dir != "" {
+		if err := d.Delete(ctx, normalizeDir(dir)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// Path 返回 OSS 逻辑路径表示。
+func (d *Driver) Path(key string) string {
+	return "oss://" + strings.TrimSpace(d.cfg.Bucket) + "/" + d.objectKey(key)
+}
+
+// URL 为公开对象生成访问地址。
+func (d *Driver) URL(key string) (string, error) {
+	if d.visibility != filesystem.VisibilityPublic {
+		return "", filesystem.ErrPublicURLUnavailable
+	}
+	return joinURL(d.baseURL, d.objectKey(key)), nil
+}
+
+// TemporaryURL 使用 OSS SDK 生成签名访问地址。
+func (d *Driver) TemporaryURL(ctx context.Context, key string, expiry time.Time) (string, error) {
+	_ = ctx
+	seconds := int64(time.Until(expiry).Seconds())
+	if seconds <= 0 {
+		return "", filesystem.ErrTemporaryURLInvalid
+	}
+	return d.bucket.SignURL(d.objectKey(key), oss.HTTPGet, seconds)
+}
+
+// ProvidesTemporaryURLs 判断 OSS 是否支持临时访问链接。
+func (d *Driver) ProvidesTemporaryURLs() bool {
+	return true
+}
+
+// ProvidesTemporaryUploadURLs 判断 OSS 是否支持临时上传链接。
+func (d *Driver) ProvidesTemporaryUploadURLs() bool {
+	return true
+}
+
+// TemporaryUploadURL 使用 OSS SDK 生成签名 PUT 上传地址。
+func (d *Driver) TemporaryUploadURL(ctx context.Context, key string, expiry time.Time, opts ...filesystem.TemporaryUploadURLOptions) (filesystem.TemporaryUploadURLResult, error) {
+	_ = ctx
+	seconds := int64(time.Until(expiry).Seconds())
+	if seconds <= 0 {
+		return filesystem.TemporaryUploadURLResult{}, filesystem.ErrTemporaryURLInvalid
+	}
+	put := filesystem.TemporaryUploadURLOptions{}
+	if len(opts) > 0 {
+		put = opts[0]
+	}
+	options := []oss.Option{}
+	headers := make(map[string]string, len(put.Headers)+2)
+	for k, v := range put.Headers {
+		headers[k] = v
+	}
+	if strings.TrimSpace(put.ContentType) != "" {
+		options = append(options, oss.ContentType(put.ContentType))
+		headers[oss.HTTPHeaderContentType] = put.ContentType
+	}
+	if strings.TrimSpace(put.Visibility) != "" {
+		acl := d.objectACL(put.Visibility)
+		options = append(options, oss.ObjectACL(acl))
+		headers["x-oss-object-acl"] = string(acl)
+	}
+	url, err := d.bucket.SignURL(d.objectKey(key), oss.HTTPPut, seconds, options...)
+	if err != nil {
+		return filesystem.TemporaryUploadURLResult{}, err
+	}
+	return filesystem.TemporaryUploadURLResult{
+		URL:     url,
+		Method:  http.MethodPut,
+		Headers: headers,
+		Fields:  map[string]string{},
+		Expires: expiry,
+	}, nil
+}
+
+// SetVisibility 把对象 ACL 映射为 public/private。
+func (d *Driver) SetVisibility(ctx context.Context, key, visibility string) error {
+	return d.bucket.SetObjectACL(d.objectKey(key), d.objectACL(visibility), ossRequestOptions(ctx)...)
+}
+
+// GetVisibility 读取对象 ACL 并归一化为统一可见性值。
+func (d *Driver) GetVisibility(ctx context.Context, key string) (string, error) {
+	result, err := d.bucket.GetObjectACL(d.objectKey(key), ossRequestOptions(ctx)...)
+	if err != nil {
+		return "", err
+	}
+	switch result.ACL {
+	case string(oss.ACLPublicRead), string(oss.ACLPublicReadWrite):
+		return filesystem.VisibilityPublic, nil
+	default:
+		return filesystem.VisibilityPrivate, nil
+	}
+}
+
+// ossRequestOptions 为每个 OSS 网络请求注入 context，确保取消和超时能传递到底层 HTTP 请求。
+func ossRequestOptions(ctx context.Context, options ...oss.Option) []oss.Option {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return append([]oss.Option{oss.WithContext(ctx)}, options...)
+}
+
+// objectKey 把业务相对路径拼接为 OSS 对象 key。
+func (d *Driver) objectKey(key string) string {
+	return joinKey(d.cfg.Prefix, key)
+}
+
+// stripPrefix 把 OSS 返回的完整对象 key 转回业务相对路径。
+func (d *Driver) stripPrefix(key string) string {
+	key = normalizeKey(key)
+	prefix := strings.TrimSuffix(d.cfg.Prefix, "/")
+	if prefix != "" {
+		key = strings.TrimPrefix(strings.TrimPrefix(key, prefix), "/")
+	}
+	return key
+}
+
+// objectACL 把统一 visibility 转换为 OSS ACL 类型。
+func (d *Driver) objectACL(visibility string) oss.ACLType {
+	if ensureVisibility(visibility, d.visibility) == filesystem.VisibilityPublic {
+		return oss.ACLPublicRead
+	}
+	return oss.ACLPrivate
+}
+
+// fileInfoFromHeaders 从 OSS 响应头中提取统一文件元信息。
+func (d *Driver) fileInfoFromHeaders(key string, headers http.Header) filesystem.FileInfo {
+	size, _ := strconv.ParseInt(headers.Get("Content-Length"), 10, 64)
+	lastModified, _ := time.Parse(http.TimeFormat, headers.Get("Last-Modified"))
+	return filesystem.FileInfo{
+		Path:         normalizeKey(key),
+		Size:         size,
+		LastModified: lastModified,
+		ContentType:  headers.Get("Content-Type"),
+	}
+}
+
+// fileInfoFromResponse 从 OSS GetObject 响应中提取统一文件元信息。
+func (d *Driver) fileInfoFromResponse(key string, response *oss.Response) filesystem.FileInfo {
+	if response == nil {
+		return filesystem.FileInfo{Path: normalizeKey(key)}
+	}
+	return d.fileInfoFromHeaders(key, response.Headers)
+}
+
+// appendOrReplace 用于在分页列举中追加 continuation token 选项。
+func appendOrReplace(options []oss.Option, next oss.Option) []oss.Option {
+	if len(options) == 0 {
+		return []oss.Option{next}
+	}
+	return append(options, next)
+}
