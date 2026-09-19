@@ -1,6 +1,6 @@
 module github.com/prismgo/oss
 
-go 1.25.0
+go 1.26.0
 
 require (
 	github.com/aliyun/aliyun-oss-go-sdk v3.0.2+incompatible
